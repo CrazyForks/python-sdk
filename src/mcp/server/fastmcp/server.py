@@ -34,6 +34,7 @@ from mcp.server.auth.provider import OAuthAuthorizationServerProvider
 from mcp.server.auth.settings import (
     AuthSettings,
 )
+from mcp.server.elicitation import ElicitationResult, ElicitSchemaModelT, elicit_with_validation
 from mcp.server.fastmcp.exceptions import ResourceError
 from mcp.server.fastmcp.prompts import Prompt, PromptManager
 from mcp.server.fastmcp.resources import FunctionResource, Resource, ResourceManager
@@ -49,12 +50,12 @@ from mcp.server.sse import SseServerTransport
 from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http import EventStore
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.context import LifespanContextT, RequestContext, RequestT
 from mcp.types import (
     AnyFunction,
-    EmbeddedResource,
+    ContentBlock,
     GetPromptResult,
-    ImageContent,
     TextContent,
     ToolAnnotations,
 )
@@ -96,9 +97,7 @@ class Settings(BaseSettings, Generic[LifespanResultT]):
 
     # StreamableHTTP settings
     json_response: bool = False
-    stateless_http: bool = (
-        False  # If True, uses true stateless mode (new transport per request)
-    )
+    stateless_http: bool = False  # If True, uses true stateless mode (new transport per request)
 
     # resource settings
     warn_on_duplicate_resources: bool = True
@@ -114,19 +113,20 @@ class Settings(BaseSettings, Generic[LifespanResultT]):
         description="List of dependencies to install in the server environment",
     )
 
-    lifespan: (
-        Callable[[FastMCP], AbstractAsyncContextManager[LifespanResultT]] | None
-    ) = Field(None, description="Lifespan context manager")
+    lifespan: Callable[[FastMCP], AbstractAsyncContextManager[LifespanResultT]] | None = Field(
+        None, description="Lifespan context manager"
+    )
 
     auth: AuthSettings | None = None
+
+    # Transport security settings (DNS rebinding protection)
+    transport_security: TransportSecuritySettings | None = None
 
 
 def lifespan_wrapper(
     app: FastMCP,
     lifespan: Callable[[FastMCP], AbstractAsyncContextManager[LifespanResultT]],
-) -> Callable[
-    [MCPServer[LifespanResultT, Request]], AbstractAsyncContextManager[object]
-]:
+) -> Callable[[MCPServer[LifespanResultT, Request]], AbstractAsyncContextManager[object]]:
     @asynccontextmanager
     async def wrap(s: MCPServer[LifespanResultT, Request]) -> AsyncIterator[object]:
         async with lifespan(app) as context:
@@ -140,8 +140,7 @@ class FastMCP:
         self,
         name: str | None = None,
         instructions: str | None = None,
-        auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any]
-        | None = None,
+        auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any] | None = None,
         event_store: EventStore | None = None,
         *,
         tools: list[Tool] | None = None,
@@ -152,31 +151,18 @@ class FastMCP:
         self._mcp_server = MCPServer(
             name=name or "FastMCP",
             instructions=instructions,
-            lifespan=(
-                lifespan_wrapper(self, self.settings.lifespan)
-                if self.settings.lifespan
-                else default_lifespan
-            ),
+            lifespan=(lifespan_wrapper(self, self.settings.lifespan) if self.settings.lifespan else default_lifespan),
         )
-        self._tool_manager = ToolManager(
-            tools=tools, warn_on_duplicate_tools=self.settings.warn_on_duplicate_tools
-        )
-        self._resource_manager = ResourceManager(
-            warn_on_duplicate_resources=self.settings.warn_on_duplicate_resources
-        )
-        self._prompt_manager = PromptManager(
-            warn_on_duplicate_prompts=self.settings.warn_on_duplicate_prompts
-        )
+        self._tool_manager = ToolManager(tools=tools, warn_on_duplicate_tools=self.settings.warn_on_duplicate_tools)
+        self._resource_manager = ResourceManager(warn_on_duplicate_resources=self.settings.warn_on_duplicate_resources)
+        self._prompt_manager = PromptManager(warn_on_duplicate_prompts=self.settings.warn_on_duplicate_prompts)
         if (self.settings.auth is not None) != (auth_server_provider is not None):
             # TODO: after we support separate authorization servers (see
             # https://github.com/modelcontextprotocol/modelcontextprotocol/pull/284)
             # we should validate that if auth is enabled, we have either an
             # auth_server_provider to host our own authorization server,
             # OR the URL of a 3rd party authorization server.
-            raise ValueError(
-                "settings.auth must be specified if and only if auth_server_provider "
-                "is specified"
-            )
+            raise ValueError("settings.auth must be specified if and only if auth_server_provider " "is specified")
         self._auth_server_provider = auth_server_provider
         self._event_store = event_store
         self._custom_starlette_routes: list[Route] = []
@@ -255,6 +241,7 @@ class FastMCP:
         return [
             MCPTool(
                 name=info.name,
+                title=info.title,
                 description=info.description,
                 inputSchema=info.parameters,
                 annotations=info.annotations,
@@ -273,9 +260,7 @@ class FastMCP:
             request_context = None
         return Context(request_context=request_context, fastmcp=self)
 
-    async def call_tool(
-        self, name: str, arguments: dict[str, Any]
-    ) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Sequence[ContentBlock]:
         """Call a tool by name with arguments."""
         context = self.get_context()
         result = await self._tool_manager.call_tool(name, arguments, context=context)
@@ -290,6 +275,7 @@ class FastMCP:
             MCPResource(
                 uri=resource.uri,
                 name=resource.name or "",
+                title=resource.title,
                 description=resource.description,
                 mimeType=resource.mime_type,
             )
@@ -302,6 +288,7 @@ class FastMCP:
             MCPResourceTemplate(
                 uriTemplate=template.uri_template,
                 name=template.name,
+                title=template.title,
                 description=template.description,
             )
             for template in templates
@@ -325,6 +312,7 @@ class FastMCP:
         self,
         fn: AnyFunction,
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         annotations: ToolAnnotations | None = None,
     ) -> None:
@@ -336,16 +324,16 @@ class FastMCP:
         Args:
             fn: The function to register as a tool
             name: Optional name for the tool (defaults to function name)
+            title: Optional human-readable title for the tool
             description: Optional description of what the tool does
             annotations: Optional ToolAnnotations providing additional tool information
         """
-        self._tool_manager.add_tool(
-            fn, name=name, description=description, annotations=annotations
-        )
+        self._tool_manager.add_tool(fn, name=name, title=title, description=description, annotations=annotations)
 
     def tool(
         self,
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         annotations: ToolAnnotations | None = None,
     ) -> Callable[[AnyFunction], AnyFunction]:
@@ -357,6 +345,7 @@ class FastMCP:
 
         Args:
             name: Optional name for the tool (defaults to function name)
+            title: Optional human-readable title for the tool
             description: Optional description of what the tool does
             annotations: Optional ToolAnnotations providing additional tool information
 
@@ -378,17 +367,32 @@ class FastMCP:
         # Check if user passed function directly instead of calling decorator
         if callable(name):
             raise TypeError(
-                "The @tool decorator was used incorrectly. "
-                "Did you forget to call it? Use @tool() instead of @tool"
+                "The @tool decorator was used incorrectly. " "Did you forget to call it? Use @tool() instead of @tool"
             )
 
         def decorator(fn: AnyFunction) -> AnyFunction:
-            self.add_tool(
-                fn, name=name, description=description, annotations=annotations
-            )
+            self.add_tool(fn, name=name, title=title, description=description, annotations=annotations)
             return fn
 
         return decorator
+
+    def completion(self):
+        """Decorator to register a completion handler.
+
+        The completion handler receives:
+        - ref: PromptReference or ResourceTemplateReference
+        - argument: CompletionArgument with name and partial value
+        - context: Optional CompletionContext with previously resolved arguments
+
+        Example:
+            @mcp.completion()
+            async def handle_completion(ref, argument, context):
+                if isinstance(ref, ResourceTemplateReference):
+                    # Return completions based on ref, argument, and context
+                    return Completion(values=["option1", "option2"])
+                return None
+        """
+        return self._mcp_server.completion()
 
     def add_resource(self, resource: Resource) -> None:
         """Add a resource to the server.
@@ -403,6 +407,7 @@ class FastMCP:
         uri: str,
         *,
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         mime_type: str | None = None,
     ) -> Callable[[AnyFunction], AnyFunction]:
@@ -420,6 +425,7 @@ class FastMCP:
         Args:
             uri: URI for the resource (e.g. "resource://my-resource" or "resource://{param}")
             name: Optional name for the resource
+            title: Optional human-readable title for the resource
             description: Optional description of the resource
             mime_type: Optional MIME type for the resource
 
@@ -461,8 +467,7 @@ class FastMCP:
 
                 if uri_params != func_params:
                     raise ValueError(
-                        f"Mismatch between URI parameters {uri_params} "
-                        f"and function parameters {func_params}"
+                        f"Mismatch between URI parameters {uri_params} " f"and function parameters {func_params}"
                     )
 
                 # Register as template
@@ -470,6 +475,7 @@ class FastMCP:
                     fn=fn,
                     uri_template=uri,
                     name=name,
+                    title=title,
                     description=description,
                     mime_type=mime_type,
                 )
@@ -479,6 +485,7 @@ class FastMCP:
                     fn=fn,
                     uri=uri,
                     name=name,
+                    title=title,
                     description=description,
                     mime_type=mime_type,
                 )
@@ -496,12 +503,13 @@ class FastMCP:
         self._prompt_manager.add_prompt(prompt)
 
     def prompt(
-        self, name: str | None = None, description: str | None = None
+        self, name: str | None = None, title: str | None = None, description: str | None = None
     ) -> Callable[[AnyFunction], AnyFunction]:
         """Decorator to register a prompt.
 
         Args:
             name: Optional name for the prompt (defaults to function name)
+            title: Optional human-readable title for the prompt
             description: Optional description of what the prompt does
 
         Example:
@@ -539,7 +547,7 @@ class FastMCP:
             )
 
         def decorator(func: AnyFunction) -> AnyFunction:
-            prompt = Prompt.from_function(func, name=name, description=description)
+            prompt = Prompt.from_function(func, name=name, title=title, description=description)
             self.add_prompt(prompt)
             return func
 
@@ -664,14 +672,13 @@ class FastMCP:
             self.settings.mount_path = mount_path
 
         # Create normalized endpoint considering the mount path
-        normalized_message_endpoint = self._normalize_path(
-            self.settings.mount_path, self.settings.message_path
-        )
+        normalized_message_endpoint = self._normalize_path(self.settings.mount_path, self.settings.message_path)
 
         # Set up auth context and dependencies
 
         sse = SseServerTransport(
             normalized_message_endpoint,
+            security_settings=self.settings.transport_security,
         )
 
         async def handle_sse(scope: Scope, receive: Receive, send: Send):
@@ -763,9 +770,7 @@ class FastMCP:
         routes.extend(self._custom_starlette_routes)
 
         # Create Starlette app with routes and middleware
-        return Starlette(
-            debug=self.settings.debug, routes=routes, middleware=middleware
-        )
+        return Starlette(debug=self.settings.debug, routes=routes, middleware=middleware)
 
     def streamable_http_app(self) -> Starlette:
         """Return an instance of the StreamableHTTP server app."""
@@ -779,12 +784,11 @@ class FastMCP:
                 event_store=self._event_store,
                 json_response=self.settings.json_response,
                 stateless=self.settings.stateless_http,  # Use the stateless setting
+                security_settings=self.settings.transport_security,
             )
 
         # Create the ASGI handler
-        async def handle_streamable_http(
-            scope: Scope, receive: Receive, send: Send
-        ) -> None:
+        async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
             await self.session_manager.handle_request(scope, receive, send)
 
         # Create routes
@@ -847,6 +851,7 @@ class FastMCP:
         return [
             MCPPrompt(
                 name=prompt.name,
+                title=prompt.title,
                 description=prompt.description,
                 arguments=[
                     MCPPromptArgument(
@@ -860,9 +865,7 @@ class FastMCP:
             for prompt in prompts
         ]
 
-    async def get_prompt(
-        self, name: str, arguments: dict[str, Any] | None = None
-    ) -> GetPromptResult:
+    async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> GetPromptResult:
         """Get a prompt by name with arguments."""
         try:
             messages = await self._prompt_manager.render_prompt(name, arguments)
@@ -875,12 +878,12 @@ class FastMCP:
 
 def _convert_to_content(
     result: Any,
-) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+) -> Sequence[ContentBlock]:
     """Convert a result to a sequence of content objects."""
     if result is None:
         return []
 
-    if isinstance(result, TextContent | ImageContent | EmbeddedResource):
+    if isinstance(result, ContentBlock):
         return [result]
 
     if isinstance(result, Image):
@@ -935,9 +938,7 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
     def __init__(
         self,
         *,
-        request_context: (
-            RequestContext[ServerSessionT, LifespanContextT, RequestT] | None
-        ) = None,
+        request_context: (RequestContext[ServerSessionT, LifespanContextT, RequestT] | None) = None,
         fastmcp: FastMCP | None = None,
         **kwargs: Any,
     ):
@@ -961,9 +962,7 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
             raise ValueError("Context is not available outside of a request")
         return self._request_context
 
-    async def report_progress(
-        self, progress: float, total: float | None = None, message: str | None = None
-    ) -> None:
+    async def report_progress(self, progress: float, total: float | None = None, message: str | None = None) -> None:
         """Report progress for the current operation.
 
         Args:
@@ -971,11 +970,7 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
             total: Optional total value e.g. 100
             message: Optional message e.g. Starting render...
         """
-        progress_token = (
-            self.request_context.meta.progressToken
-            if self.request_context.meta
-            else None
-        )
+        progress_token = self.request_context.meta.progressToken if self.request_context.meta else None
 
         if progress_token is None:
             return
@@ -996,10 +991,39 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
         Returns:
             The resource content as either text or bytes
         """
-        assert (
-            self._fastmcp is not None
-        ), "Context is not available outside of a request"
+        assert self._fastmcp is not None, "Context is not available outside of a request"
         return await self._fastmcp.read_resource(uri)
+
+    async def elicit(
+        self,
+        message: str,
+        schema: type[ElicitSchemaModelT],
+    ) -> ElicitationResult[ElicitSchemaModelT]:
+        """Elicit information from the client/user.
+
+        This method can be used to interactively ask for additional information from the
+        client within a tool's execution. The client might display the message to the
+        user and collect a response according to the provided schema. Or in case a
+        client is an agent, it might decide how to handle the elicitation -- either by asking
+        the user or automatically generating a response.
+
+        Args:
+            schema: A Pydantic model class defining the expected response structure, according to the specification,
+                    only primive types are allowed.
+            message: Optional message to present to the user. If not provided, will use
+                    a default message based on the schema
+
+        Returns:
+            An ElicitationResult containing the action taken and the data if accepted
+
+        Note:
+            Check the result.action to determine if the user accepted, declined, or cancelled.
+            The result.data will only be populated if action is "accept" and validation succeeded.
+        """
+
+        return await elicit_with_validation(
+            session=self.request_context.session, message=message, schema=schema, related_request_id=self.request_id
+        )
 
     async def log(
         self,
@@ -1026,11 +1050,7 @@ class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
     @property
     def client_id(self) -> str | None:
         """Get the client ID if available."""
-        return (
-            getattr(self.request_context.meta, "client_id", None)
-            if self.request_context.meta
-            else None
-        )
+        return getattr(self.request_context.meta, "client_id", None) if self.request_context.meta else None
 
     @property
     def request_id(self) -> str:
